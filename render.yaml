@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: dogma-fx-web
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app
