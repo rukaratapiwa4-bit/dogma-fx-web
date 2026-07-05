@@ -125,6 +125,9 @@ class PriceFeedAdapter:
         self._fm.on_tick(instrument, timestamp_utc, bid, ask,
                          bid_volume, ask_volume, latency_ms)
 
+    def on_feed_outage(self, instrument: str, reason: str):
+        self._fm.on_feed_outage(instrument, reason)
+
     def add_instrument(self, instrument: str, source):
         self._fm.add_instrument(instrument, source)
 
@@ -234,11 +237,16 @@ class Layer1FeedBundle:
         except Exception: pass
         logger.info("Layer 1 feeds stopped ✅")
 
-    def on_tick(self, pair: str, ts: float,
+    # ✅ FIXED: OANDA feed calls on_tick with 'instrument' parameter
+    def on_tick(self, instrument: str, timestamp_utc: float,
                 bid: float, ask: float,
-                bid_vol: float = 0.0, ask_vol: float = 0.0,
+                bid_volume: float = 0.0, ask_volume: float = 0.0,
                 latency_ms: Optional[float] = None):
-        self.price_feed.on_tick(pair, ts, bid, ask, bid_vol, ask_vol, latency_ms)
+        self.price_feed.on_tick(instrument, timestamp_utc, bid, ask,
+                                bid_volume, ask_volume, latency_ms)
+
+    def on_feed_outage(self, instrument: str, reason: str):
+        self.price_feed.on_feed_outage(instrument, reason)
 
     def get_snapshot(self, pair: str) -> dict:
         return {
@@ -739,7 +747,7 @@ class OANDALiveFeedConnector:
                 stream = OANDAStreamingFeed(
                     api_key      = self._cfg.oanda_api_key,
                     account_id   = self._cfg.oanda_account_id or "",
-                    feed_manager = self._feeds,   # ✅ Pass the feed manager
+                    feed_manager = self._feeds,
                     instruments  = [oanda_instrument],
                     practice     = self._cfg.oanda_practice,
                 )
@@ -773,7 +781,10 @@ class OANDALiveFeedConnector:
                     bid   = prices[pair]
                     ask   = bid + pip * rng.uniform(0.8, 2.5)
                     self._feeds.on_tick(
-                        pair, time.time() * 1000, bid, ask
+                        instrument=pair,
+                        timestamp_utc=time.time() * 1000,
+                        bid=bid,
+                        ask=ask
                     )
                 time.sleep(self._cfg.tick_interval_ms / 1000)
 
