@@ -1,7 +1,11 @@
 services:
   - type: web
-    name: dogma-fx-web
+    name: journal-dashboard
     runtime: python
-    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app
+    startCommand: python journal_dashboard.py
+    envVars:
+      - key: JOURNAL_DB
+        value: journal.db
+      - key: PUTER_TOKEN
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InYyIn0.eyJ0IjoidCIsInYiOiIyIiwidG9rZW5fdWlkIjoiMGJiZWFmYTMtZTIwMS00NzI2LWI5NDQtZGNjMjk2Mjg1MmQ0IiwidXUiOiJ1QXhxUnhFQlRNYUNhdnFuQUIwQ2NBPT0iLCJzdSI6ImpPcHVNMlJoUXJLNmhvb25NVFcyVFE9PSIsImFpIjoidUF4cVJ4RUJUTWFDYXZxbkFCMENjQT09IiwiZnVsbF9hY2Nlc3MiOnRydWUsImlhdCI6MTc4MzE1OTQ2MH0.WcaXkVrX9Y5QNQGZB8UdM4_L7uiJzVOzruR3-rgVmpU
