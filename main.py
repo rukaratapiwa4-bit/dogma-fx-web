@@ -737,13 +737,11 @@ class OANDALiveFeedConnector:
             for pair in self._cfg.pairs:
                 oanda_instrument = pair.replace("/", "_")
                 stream = OANDAStreamingFeed(
-                    api_key     = self._cfg.oanda_api_key,
-                    account_id  = self._cfg.oanda_account_id or "",
-                    instruments = [oanda_instrument],   # ✅ CORRECTED: list of instruments
-                    practice    = self._cfg.oanda_practice,
-                    on_tick     = lambda ts, bid, ask, p=pair: (
-                        self._feeds.on_tick(p, ts, bid, ask)
-                    )
+                    api_key      = self._cfg.oanda_api_key,
+                    account_id   = self._cfg.oanda_account_id or "",
+                    feed_manager = self._feeds,   # ✅ Pass the feed manager
+                    instruments  = [oanda_instrument],
+                    practice     = self._cfg.oanda_practice,
                 )
                 stream.start()
                 self._streams.append(stream)
@@ -1015,13 +1013,11 @@ collector = DataCollector()
 
 @app.route('/')
 def index():
-    # ✅ get() already refreshes internally – no separate refresh() call needed
     data = collector.get()
     return build_html(data)
 
 @app.route('/api/data')
 def api_data():
-    # ✅ get() already refreshes internally – no separate refresh() call needed
     data = collector.get()
     return jsonify(data)
 
@@ -1062,4 +1058,4 @@ if __name__ == "__main__":
     trading_thread.start()
 
     port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)   # ✅ Fixed: no extra 'bug=False)'
+    app.run(host="0.0.0.0", port=port, debug=False)
