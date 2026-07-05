@@ -2,13 +2,7 @@
 ═══════════════════════════════════════════════════════════════════════════════
 FOREX TRADING SIGNAL SYSTEM — VERSION 6.0
 FILE: journal_system.py
-LAYER: 6 — MEMORY & JOURNAL SYSTEM (Supabase)
-═══════════════════════════════════════════════════════════════════════════════
-
-PURPOSE:
-    Records everything using Supabase (cloud database).
-    Both engine and dashboard can access the same data.
-
+LAYER: 6 — MEMORY & JOURNAL SYSTEM (Supabase + SQLite fallback)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -31,16 +25,9 @@ logger = logging.getLogger("JournalSystem")
 # ── Supabase connection string from environment ──
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-if not DATABASE_URL:
-    logger.warning("DATABASE_URL not set — using SQLite fallback")
-    import sqlite3
-    SQLITE_FALLBACK = True
-else:
-    SQLITE_FALLBACK = False
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — JOURNAL ENTRY STRUCTURES
+# SECTION 1 — JOURNAL ENTRY STRUCTURES (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -177,12 +164,10 @@ class NullJournalEntry:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — SUPABASE STORAGE ENGINE
+# SECTION 2 — SUPABASE STORAGE ENGINE (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SupabaseStorage:
-    """Supabase PostgreSQL storage for all journal entries."""
-
     def __init__(self, database_url: str):
         self.database_url = database_url
         self._local = threading.local()
@@ -190,18 +175,19 @@ class SupabaseStorage:
         self._init_tables()
 
     def _get_conn(self):
-        """Get thread-local connection."""
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = psycopg2.connect(self.database_url)
+            # Add connection timeout and SSL requirement
+            self._local.conn = psycopg2.connect(
+                self.database_url,
+                connect_timeout=10,
+                sslmode='require'
+            )
             self._local.conn.autocommit = True
         return self._local.conn
 
     def _init_tables(self):
-        """Create all tables if they don't exist."""
         conn = self._get_conn()
         cur = conn.cursor()
-
-        # Trades table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 journal_id          TEXT PRIMARY KEY,
@@ -273,8 +259,6 @@ class SupabaseStorage:
                 mtf_at_exit         REAL
             )
         """)
-
-        # NULLs table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS nulls (
                 journal_id          TEXT PRIMARY KEY,
@@ -304,8 +288,6 @@ class SupabaseStorage:
                 causal_notes        TEXT
             )
         """)
-
-        # Performance snapshots
         cur.execute("""
             CREATE TABLE IF NOT EXISTS performance_snapshots (
                 snapshot_id         TEXT PRIMARY KEY,
@@ -327,27 +309,22 @@ class SupabaseStorage:
                 most_common_null    TEXT
             )
         """)
-
-        # Create indexes
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_pair ON trades(pair)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_regime ON trades(l3_regime_tag)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp_utc)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_nulls_pair ON nulls(pair)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_nulls_type ON nulls(primary_null)")
-
         conn.commit()
         cur.close()
         logger.info("Supabase tables initialised ✅")
 
     def insert_trade(self, entry: TradeJournalEntry):
-        """Insert trade journal entry."""
         conn = self._get_conn()
         cur = conn.cursor()
         d = entry.to_dict()
         columns = ", ".join(d.keys())
         placeholders = ", ".join(["%s"] * len(d))
         values = list(d.values())
-
         query = f"INSERT INTO trades ({columns}) VALUES ({placeholders}) ON CONFLICT (journal_id) DO UPDATE SET "
         set_clause = ", ".join([f"{k} = EXCLUDED.{k}" for k in d.keys()])
         query += set_clause
@@ -360,14 +337,12 @@ class SupabaseStorage:
             cur.close()
 
     def insert_null(self, entry: NullJournalEntry):
-        """Insert NULL journal entry."""
         conn = self._get_conn()
         cur = conn.cursor()
         d = entry.to_dict()
         columns = ", ".join(d.keys())
         placeholders = ", ".join(["%s"] * len(d))
         values = list(d.values())
-
         query = f"INSERT INTO nulls ({columns}) VALUES ({placeholders}) ON CONFLICT (journal_id) DO UPDATE SET "
         set_clause = ", ".join([f"{k} = EXCLUDED.{k}" for k in d.keys()])
         query += set_clause
@@ -385,7 +360,6 @@ class SupabaseStorage:
                            actual_rr: float, trade_status: str,
                            hold_hours: float, regime_at_exit: Optional[str] = None,
                            mtf_at_exit: Optional[float] = None):
-        """Update trade record with exit data."""
         conn = self._get_conn()
         cur = conn.cursor()
         try:
@@ -422,12 +396,10 @@ class SupabaseStorage:
                       last_n: Optional[int] = None,
                       winners_only: bool = False,
                       losers_only: bool = False) -> list:
-        """Query trades with optional filters."""
         conn = self._get_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         where = []
         params = []
-
         if pair:
             where.append("pair = %s")
             params.append(pair)
@@ -439,14 +411,12 @@ class SupabaseStorage:
         if losers_only:
             where.append("was_winner = 0")
         where.append("exit_time IS NOT NULL")
-
         sql = "SELECT * FROM trades"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY timestamp_utc DESC"
         if last_n:
             sql += f" LIMIT {last_n}"
-
         try:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -460,26 +430,22 @@ class SupabaseStorage:
     def query_nulls(self, pair: Optional[str] = None,
                      null_type: Optional[str] = None,
                      last_n: Optional[int] = None) -> list:
-        """Query NULL entries."""
         conn = self._get_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         where = []
         params = []
-
         if pair:
             where.append("pair = %s")
             params.append(pair)
         if null_type:
             where.append("primary_null = %s")
             params.append(null_type)
-
         sql = "SELECT * FROM nulls"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY timestamp_utc DESC"
         if last_n:
             sql += f" LIMIT {last_n}"
-
         try:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -491,7 +457,6 @@ class SupabaseStorage:
             cur.close()
 
     def save_performance_snapshot(self, snapshot: dict):
-        """Save performance analysis snapshot."""
         conn = self._get_conn()
         cur = conn.cursor()
         try:
@@ -530,12 +495,10 @@ class SupabaseStorage:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — SQLite FALLBACK (if no DATABASE_URL)
+# SECTION 3 — SQLite STORAGE (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SQLiteStorage:
-    """SQLite fallback storage (same as original)."""
-
     def __init__(self, db_path: str = "journal.db"):
         self.db_path = db_path
         self._local = threading.local()
@@ -759,14 +722,12 @@ class SQLiteStorage:
         if losers_only:
             where.append("was_winner = 0")
         where.append("exit_time IS NOT NULL")
-
         sql = "SELECT * FROM trades"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY timestamp_utc DESC"
         if last_n:
             sql += f" LIMIT {last_n}"
-
         try:
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
@@ -784,14 +745,12 @@ class SQLiteStorage:
         if null_type:
             where.append("primary_null = ?")
             params.append(null_type)
-
         sql = "SELECT * FROM nulls"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY timestamp_utc DESC"
         if last_n:
             sql += f" LIMIT {last_n}"
-
         try:
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
@@ -836,7 +795,7 @@ class SQLiteStorage:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — PERFORMANCE ANALYZER
+# SECTION 4 — PERFORMANCE ANALYZER (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PerformanceAnalyzer:
@@ -847,26 +806,22 @@ class PerformanceAnalyzer:
         trades = self._storage.query_trades(regime=regime)
         if not trades:
             return {"regime": regime or "ALL", "n_trades": 0, "sufficient": False}
-
         import statistics
         import math
         pnls = [t["realized_pnl"] for t in trades if t.get("realized_pnl") is not None]
         winners = [p for p in pnls if p > 0]
         losers = [p for p in pnls if p <= 0]
         n = len(pnls)
-
         win_rate = len(winners) / n if n > 0 else 0
         avg_win = sum(winners) / len(winners) if winners else 0
         avg_loss = sum(losers) / len(losers) if losers else 0
         avg_pnl = sum(pnls) / n if n > 0 else 0
         ev_point = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
-
         if len(pnls) > 1:
             pnl_std = statistics.stdev(pnls)
             sharpe = (avg_pnl / pnl_std * math.sqrt(252)) if pnl_std > 0 else 0
         else:
             sharpe = 0
-
         def rolling_ev(window):
             subset = pnls[-window:]
             if not subset:
@@ -877,7 +832,6 @@ class PerformanceAnalyzer:
             aw = sum(w) / len(w) if w else 0
             al = sum(l) / len(l) if l else 0
             return round((wr * aw) + ((1 - wr) * al), 2)
-
         cumulative = 0.0
         peak = 0.0
         max_dd = 0.0
@@ -887,7 +841,6 @@ class PerformanceAnalyzer:
                 peak = cumulative
             dd = (peak - cumulative) / peak if peak > 0 else 0
             max_dd = max(max_dd, dd)
-
         return {
             "regime": regime or "ALL",
             "n_trades": n,
@@ -912,13 +865,11 @@ class PerformanceAnalyzer:
         nulls = self._storage.query_nulls()
         if not nulls:
             return {"n_nulls": 0, "message": "No NULL records"}
-
         from collections import defaultdict
         null_counts = defaultdict(int)
         for n in nulls:
             nt = n.get("primary_null", "UNKNOWN")
             null_counts[nt] += 1
-
         total = len(nulls)
         return {
             "n_nulls": total,
@@ -954,21 +905,23 @@ class PerformanceAnalyzer:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — JOURNAL MANAGER (MAIN CLASS)
+# SECTION 5 — JOURNAL MANAGER (with Supabase fallback)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class JournalManager:
     def __init__(self, db_path: str = "journal.db", database_url: Optional[str] = None):
         self.db_path = db_path
-
-        # Use Supabase if URL provided, otherwise SQLite
         self._database_url = database_url or DATABASE_URL
 
+        # Try Supabase first; if it fails, fall back to SQLite
         if self._database_url:
-            logger.info("Using Supabase for journal storage")
-            self._storage = SupabaseStorage(self._database_url)
+            try:
+                self._storage = SupabaseStorage(self._database_url)
+                logger.info("Using Supabase for journal storage")
+            except Exception as e:
+                logger.warning(f"Supabase connection failed: {e}. Falling back to SQLite.")
+                self._storage = SQLiteStorage(db_path)
         else:
-            logger.info("Using SQLite for journal storage (fallback)")
             self._storage = SQLiteStorage(db_path)
 
         self._analyzer = PerformanceAnalyzer(self._storage)
@@ -977,6 +930,7 @@ class JournalManager:
         self._lock = threading.Lock()
         logger.info("JournalManager initialized")
 
+    # All other methods (record_trade_open, record_trade_close, record_null, etc.) remain unchanged
     def record_trade_open(self, trade_id: str, pair: str, direction: str,
                            decision: dict, feature_pkg: dict,
                            risk_output: dict, portfolio_output: dict,
