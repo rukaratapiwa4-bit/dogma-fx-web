@@ -4,45 +4,6 @@ FOREX TRADING SIGNAL SYSTEM — VERSION 6.0
 FILE: main.py
 LAYER: SYSTEM INTEGRATION — MASTER ORCHESTRATOR
 ═══════════════════════════════════════════════════════════════════════════════
-
-PURPOSE:
-    Wires all 10 layers into one running system.
-    Manages startup, shutdown, the main signal loop, and the background
-    learning/monitoring threads.
-
-SIGNAL FLOW (per tick cycle):
-    Layer 1  → FeedManager + ancillary feeds (price, news, COT, multi-asset,
-                                               options, calendar)
-        ↓
-    Layer 2  → FeatureEngine.compute_all_pairs()
-        ↓
-    Layer 3  → DecisionEngine.decide_all_pairs()
-        ↓
-    Gate 1   → RiskControlManager.process()          (Hard Safety)
-        ↓
-    Gate 4B  → PortfolioExposureManager.process()    (Portfolio)
-        ↓
-    Layer 5  → ExecutionEngine.execute()              (Fill + PFVW)
-        ↓
-    Layer 6  → JournalManager.record_trade_open/close/null()
-        ↓ (background threads)
-    Layer 7  → ValidationEngine (scheduled)
-    Layer 8  → LearningLoop (scheduled)
-    Layer 9  → ChaosModeEngine (parallel — every tick)
-    Layer 10 → OptimizationEngine (every tick on open positions)
-
-THREADING MODEL:
-    Main thread      → signal loop (tick → decision → execution)
-    Chaos thread     → Layer 9 stress monitoring (every tick)
-    Optimization thread → Layer 10 position management (every 30s)
-    Learning thread  → Layers 7+8 cycle (every 6 hours)
-    Feed threads     → Layer 1 ancillary feeds (each has own schedule)
-
-CONFIGURATION:
-    All runtime config lives in SystemConfig dataclass below.
-    Paper trading = True by default — set to False for live.
-
-═══════════════════════════════════════════════════════════════════════════════
 """
 
 import sys
@@ -52,11 +13,11 @@ import signal
 import logging
 import threading
 import traceback
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 from pathlib import Path
 from datetime import datetime, timezone
-import os
 
 # ── Layer 1: Market Data ──────────────────────────────────────────────────────
 from market_data_feed import FeedManager, DataSource
@@ -115,15 +76,9 @@ logger = logging.getLogger("SYSTEM")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PRICE FEED ADAPTER
-# Wraps FeedManager to provide get_layer1_package() interface Layer 2 expects
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PriceFeedAdapter:
-    """
-    Wraps FeedManager and exposes get_layer1_package(pair) so
-    FeatureEngine.compute_all_pairs() can call it correctly.
-    Mirrors Layer1OutputFeed without requiring the import.
-    """
     def __init__(self, feed_manager: FeedManager):
         self._fm = feed_manager
 
@@ -180,47 +135,27 @@ class PriceFeedAdapter:
 
 @dataclass
 class SystemConfig:
-    """
-    All runtime configuration in one place.
-    Change values here — nothing else needs touching.
-    """
-    # ── Account ───────────────────────────────────────────────────────────────
     account_balance         : float = 10_000.0
-    paper_trading           : bool  = True      # False = live orders
-
-    # ── Pairs to trade ────────────────────────────────────────────────────────
+    paper_trading           : bool  = True
     pairs: list = field(default_factory=lambda: [
         "EUR/USD", "GBP/USD", "USD/JPY",
         "AUD/USD", "USD/CAD", "NZD/USD",
     ])
-
-    # ── API keys (set via env or replace here) ────────────────────────────────
-    oanda_api_key           : Optional[str] = None   # OANDA v20 API key
-    oanda_account_id        : Optional[str] = None   # OANDA account ID
-    oanda_practice          : bool  = True            # True = practice account
-    anthropic_api_key       : Optional[str] = None   # For Claude news processing
-
-    # ── Data feed settings ────────────────────────────────────────────────────
-    tick_interval_ms        : int   = 500    # Min ms between signal evaluations
-    multi_asset_refresh_s   : int   = 60     # Multi-asset refresh interval
-    news_refresh_min        : int   = 5      # News feed refresh
-    cot_refresh_h           : float = 6.0    # COT refresh (weekly data)
-    options_refresh_min     : int   = 30     # Options/vol refresh
-
-    # ── Learning cycle ────────────────────────────────────────────────────────
-    learning_cycle_hours    : float = 6.0    # How often Layer 7/8 runs
-
-    # ── Optimization cycle ────────────────────────────────────────────────────
-    optimization_interval_s : int   = 30     # How often Layer 10 evaluates
-
-    # ── Journal ───────────────────────────────────────────────────────────────
+    oanda_api_key           : Optional[str] = None
+    oanda_account_id        : Optional[str] = None
+    oanda_practice          : bool  = True
+    anthropic_api_key       : Optional[str] = None
+    tick_interval_ms        : int   = 500
+    multi_asset_refresh_s   : int   = 60
+    news_refresh_min        : int   = 5
+    cot_refresh_h           : float = 6.0
+    options_refresh_min     : int   = 30
+    learning_cycle_hours    : float = 6.0
+    optimization_interval_s : int   = 30
     journal_db_path         : str   = "journal.db"
-
-    # ── Logging ───────────────────────────────────────────────────────────────
     log_level               : str   = "INFO"
 
     def load_from_env(self):
-        """Load API keys from environment variables."""
         import os
         self.oanda_api_key      = os.getenv("OANDA_API_KEY",      self.oanda_api_key)
         self.oanda_account_id   = os.getenv("OANDA_ACCOUNT_ID",   self.oanda_account_id)
@@ -240,41 +175,22 @@ class SystemConfig:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Layer1FeedBundle:
-    """
-    Initialises and manages all Layer 1 data sources.
-
-    Contains:
-        price_feed    → FeedManager (tick data per pair)
-        calendar      → EconomicCalendarManager
-        news          → NewsSentimentManager
-        cot           → COTManager
-        multi_asset   → MultiAssetManager
-        options       → OptionsFlowManager
-
-    All managers run on independent background threads.
-    get_snapshot() returns a merged Layer 1 package for Layer 2 consumption.
-    """
-
     def __init__(self, cfg: SystemConfig):
         self._cfg = cfg
         logger.info("Initialising Layer 1 feeds...")
 
-        # ── Price feed (per pair) ─────────────────────────────────────────────
         _raw_feed = FeedManager()
         for pair in cfg.pairs:
             _raw_feed.add_instrument(pair, DataSource.LIVE_SOURCE)
 
-        # PriceFeedAdapter wraps FeedManager — single interface for all layers
         self.price_feed    = PriceFeedAdapter(_raw_feed)
-        self.price_feed_l1 = self.price_feed   # alias — Layer 2 uses this
+        self.price_feed_l1 = self.price_feed
 
-        # ── Economic Calendar ──────────────────────────────────────────────────
         self.calendar = EconomicCalendarManager(
             api_key        = cfg.oanda_api_key,
             oanda_practice = cfg.oanda_practice,
         )
 
-        # ── News & Sentiment ───────────────────────────────────────────────────
         self.news = NewsSentimentManager(
             claude_api_key = cfg.anthropic_api_key,
             oanda_api_key  = cfg.oanda_api_key,
@@ -282,15 +198,12 @@ class Layer1FeedBundle:
             oanda_practice = cfg.oanda_practice,
         )
 
-        # ── COT Report ────────────────────────────────────────────────────────
         self.cot = COTManager(refresh_hours=cfg.cot_refresh_h)
 
-        # ── Multi-Asset (DXY, Gold, VIX etc.) ────────────────────────────────
         self.multi_asset = MultiAssetManager(
             refresh_seconds = cfg.multi_asset_refresh_s,
         )
 
-        # ── Options & Volatility Flow ─────────────────────────────────────────
         self.options = OptionsFlowManager(
             oanda_api_key  = cfg.oanda_api_key,
             oanda_practice = cfg.oanda_practice,
@@ -299,7 +212,6 @@ class Layer1FeedBundle:
         logger.info("Layer 1 feeds initialised ✅")
 
     def start(self):
-        """Start all background feed threads."""
         logger.info("Starting Layer 1 feed threads...")
         self.calendar.start()
         self.news.start()
@@ -309,7 +221,6 @@ class Layer1FeedBundle:
         logger.info("All Layer 1 feed threads running ✅")
 
     def stop(self):
-        """Stop all background feed threads."""
         logger.info("Stopping Layer 1 feed threads...")
         try: self.calendar.stop()
         except Exception: pass
@@ -327,23 +238,9 @@ class Layer1FeedBundle:
                 bid: float, ask: float,
                 bid_vol: float = 0.0, ask_vol: float = 0.0,
                 latency_ms: Optional[float] = None):
-        """Route a live tick into the price feed pipeline."""
         self.price_feed.on_tick(pair, ts, bid, ask, bid_vol, ask_vol, latency_ms)
 
     def get_snapshot(self, pair: str) -> dict:
-        """
-        Merge all Layer 1 packages into one dict for Layer 2.
-
-        Returns:
-            {
-                "price"      : dict   (market state from FeedManager)
-                "calendar"   : dict   (economic event window)
-                "news"       : dict   (news + sentiment scores)
-                "cot"        : dict   (COT positioning scores)
-                "multi_asset": dict   (DXY, VIX, Gold, correlations)
-                "options"    : dict   (IV surfaces, flow scores)
-            }
-        """
         return {
             "price"      : self.price_feed_l1.get_layer1_package(pair) or {},
             "calendar"   : self.calendar.get_layer1_package(pair) or {},
@@ -354,7 +251,6 @@ class Layer1FeedBundle:
         }
 
     def get_feed_health(self) -> dict:
-        """Aggregate feed health across all sources."""
         return {
             "price_feed" : {p: self.price_feed.get_state(p) for p in self._cfg.pairs},
             "calendar"   : getattr(self.calendar,   "_health", "UNKNOWN"),
@@ -366,16 +262,10 @@ class Layer1FeedBundle:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — BACKGROUND THREAD MANAGERS
+# SECTION 3 — BACKGROUND THREAD MANAGERS (Learning + Optimization)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class LearningThread:
-    """
-    Background thread: runs Layers 7 + 8 on schedule.
-    Does not block the signal loop.
-    Frequency: every cfg.learning_cycle_hours.
-    """
-
     def __init__(self, journal: JournalManager,
                  validation : ValidationEngine,
                  learning   : LearningLoop,
@@ -417,7 +307,6 @@ class LearningThread:
             f"NULL rate={counts['null_rate']:.1f}%"
         )
 
-        # Pull history
         trades = self._journal._storage.query_trades()
         nulls  = self._journal._storage.query_nulls()
 
@@ -425,7 +314,6 @@ class LearningThread:
             logger.info("LearningThread: no trades yet — skipping cycle")
             return
 
-        # Layer 7: validate all regimes
         validation_results = self._validation.validate_all_regimes(trades)
         approved_regimes   = [r for r, v in validation_results.items() if v.get("gate_passed")]
         logger.info(
@@ -433,7 +321,6 @@ class LearningThread:
             f"regimes passed gate"
         )
 
-        # Layer 8: run learning cycle
         result = self._learning.run_cycle(trades, nulls, regime="ALL")
         logger.info(
             f"Layer 8 complete: {result.proposals_approved} approved | "
@@ -441,17 +328,11 @@ class LearningThread:
             f"EV delta=${result.ev_delta or 0:.2f}"
         )
 
-        # Save performance snapshot
         self._journal.save_performance_snapshot()
         logger.info("═══ Learning cycle complete ═══")
 
 
 class OptimizationThread:
-    """
-    Background thread: runs Layer 10 on all open positions.
-    Frequency: every cfg.optimization_interval_s seconds.
-    """
-
     def __init__(self, optimizer    : OptimizationEngine,
                  execution          : 'ExecutionEngine',
                  journal            : JournalManager,
@@ -486,7 +367,6 @@ class OptimizationThread:
                 logger.error(f"OptimizationThread error: {e}")
 
     def _evaluate(self):
-        """Evaluate all active trades through Layer 10."""
         chaos_phase = self._chaos.get_state()
         active      = self._execution._active_trades if hasattr(
             self._execution, "_active_trades"
@@ -511,7 +391,6 @@ class OptimizationThread:
                 logger.error(f"OptimizationThread: error on {trade_id}: {e}")
 
     def _build_trade_state(self, trade_record, chaos_phase: str) -> TradeState:
-        """Convert ExecutionEngine TradeRecord to OptimizationEngine TradeState."""
         tr = trade_record
         return TradeState(
             trade_id           = tr.trade_id,
@@ -541,10 +420,6 @@ class OptimizationThread:
         )
 
     def _apply_decision(self, decision, trade_record):
-        """
-        Apply Layer 10 decision to the execution engine.
-        Layer 10 decisions are advisory — ExecutionEngine executes them.
-        """
         action = decision.action
 
         if action == "FULL_EXIT":
@@ -578,13 +453,6 @@ class OptimizationThread:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SignalProcessor:
-    """
-    Runs the full signal pipeline for one tick cycle:
-        Layer 2 → Layer 3 → Gate 4A → Gate 4B → Layer 5 → Layer 6
-
-    Called by the main loop on every tick (throttled by tick_interval_ms).
-    """
-
     def __init__(self,
                  feeds       : Layer1FeedBundle,
                  feature_eng : FeatureEngine,
@@ -607,13 +475,9 @@ class SignalProcessor:
         self._cycle    = 0
 
     def run_cycle(self, pairs: list):
-        """
-        Run one full signal cycle across all pairs.
-        """
         self._cycle += 1
         chaos_state = self._chaos.get_state()
 
-        # Layer 9 blocks new signals in CHAOS + COOLDOWN
         if not self._chaos.is_signals_active():
             logger.debug(
                 f"Cycle {self._cycle}: signals suspended "
@@ -621,7 +485,6 @@ class SignalProcessor:
             )
             return
 
-        # ── Layer 2: Feature Engine ───────────────────────────────────────────
         try:
             _cal_raw = self._feeds.calendar.get_layer1_package() or {}
             if _cal_raw.get("pair_window") is None:
@@ -644,7 +507,6 @@ class SignalProcessor:
         if not feature_packages:
             return
 
-        # Filter out pairs where feature computation returned None
         feature_packages = {
             pair: fp for pair, fp in feature_packages.items()
             if fp is not None
@@ -653,17 +515,14 @@ class SignalProcessor:
         if not feature_packages:
             return
 
-        # ── Layer 9: Stress reading from feature packages ─────────────────────
         self._update_chaos_monitor(feature_packages)
 
-        # ── Layer 3: Decision Engine ──────────────────────────────────────────
         try:
             decisions = self._l3.decide_all_pairs(feature_packages)
         except Exception as e:
             logger.error(f"Layer 3 error: {e}")
             return
 
-        # ── Process each pair decision ────────────────────────────────────────
         for pair, decision in decisions.items():
             try:
                 self._process_pair(
@@ -675,10 +534,6 @@ class SignalProcessor:
 
     def _process_pair(self, pair: str, decision: DecisionOutput,
                        fp: FeaturePackage, chaos_state: str):
-        """
-        Process one pair from Layer 3 decision through to execution or NULL log.
-        """
-        # ── NULL path: log and return ─────────────────────────────────────────
         if decision.primary_null is not None:
             self._l6.record_null(
                 pair        = pair,
@@ -691,7 +546,6 @@ class SignalProcessor:
             )
             return
 
-        # ── Signal path: Gate 4A → 4B → Layer 5 ──────────────────────────────
         logger.info(
             f"{pair}: SIGNAL {decision.direction} | "
             f"prob={decision.trade_probability:.2f} | "
@@ -699,7 +553,6 @@ class SignalProcessor:
             f"regime={decision.regime_tag}"
         )
 
-        # Gate 4A — Risk Control
         try:
             risk_output = self._l4a.process(
                 decision        = decision,
@@ -720,7 +573,6 @@ class SignalProcessor:
             logger.info(f"{pair}: NULL_RISK — Layer 4A blocked")
             return
 
-        # Layer 9: check risk cap
         risk_cap = self._chaos.get_risk_cap()
         if risk_cap < risk_output.risk_pct:
             risk_output.risk_pct  = risk_cap
@@ -735,7 +587,6 @@ class SignalProcessor:
                 f"{risk_cap}% (chaos phase={chaos_state})"
             )
 
-        # Gate 4B — Portfolio Exposure
         try:
             portfolio_output = self._l4b.process(
                 risk_output     = risk_output,
@@ -757,7 +608,6 @@ class SignalProcessor:
             logger.info(f"{pair}: NULL_RISK — Layer 4B blocked (portfolio)")
             return
 
-        # Layer 5 — Execution
         market = self._get_market_snapshot(pair, fp)
         if market is None:
             logger.warning(f"{pair}: no market snapshot — execution skipped")
@@ -782,7 +632,6 @@ class SignalProcessor:
             )
             return
 
-        # Layer 6 — Journal trade open
         try:
             self._l6.record_trade_open(
                 trade_id         = exec_result.get("trade_id", ""),
@@ -804,11 +653,7 @@ class SignalProcessor:
         )
 
     def _update_chaos_monitor(self, feature_packages: dict):
-        """
-        Build a StressReading from current feature packages and feed Layer 9.
-        """
         try:
-            # Aggregate across all pairs
             max_spread_ratio = 1.0
             multi_null_count = 0
             for pair, fp in feature_packages.items():
@@ -816,7 +661,6 @@ class SignalProcessor:
                     spread_r = getattr(fp, "spread_ratio", 1.0) or 1.0
                     max_spread_ratio = max(max_spread_ratio, spread_r)
 
-            # Multi-asset data for VIX + DXY
             multi = self._feeds.multi_asset.get_layer1_package() or {}
             vix   = multi.get("vix_level", 15.0) or 15.0
             dxy_m = multi.get("dxy_move_pct", 0.0) or 0.0
@@ -840,7 +684,6 @@ class SignalProcessor:
 
     def _get_market_snapshot(self, pair: str,
                               fp) -> Optional[MarketSnapshot]:
-        """Build MarketSnapshot from current feed state."""
         try:
             state = self._feeds.price_feed.get_state(pair)
             if not state:
@@ -851,7 +694,7 @@ class SignalProcessor:
                 return None
             pip_size   = 0.01 if "JPY" in pair else 0.0001
             spread_pips= round((ask - bid) / pip_size, 2)
-            avg_spread = spread_pips  # fallback — use current as average
+            avg_spread = spread_pips
             spread_ratio = 1.0
             return MarketSnapshot(
                 pair            = pair,
@@ -875,12 +718,6 @@ class SignalProcessor:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class OANDALiveFeedConnector:
-    """
-    Connects OANDA streaming feed to FeedManager.
-    Spawns one streaming thread per currency pair batch.
-    Falls back to poll-based fetch if streaming unavailable.
-    """
-
     def __init__(self, feeds: Layer1FeedBundle, cfg: SystemConfig):
         self._feeds   = feeds
         self._cfg     = cfg
@@ -921,10 +758,6 @@ class OANDALiveFeedConnector:
             except Exception: pass
 
     def _start_mock_feed(self):
-        """
-        Paper/mock tick generator — used when no live feed available.
-        Generates realistic synthetic ticks for testing.
-        """
         import random
         BASE_PRICES = {
             "EUR/USD": 1.0850, "GBP/USD": 1.2700, "USD/JPY": 148.50,
@@ -962,11 +795,6 @@ class OANDALiveFeedConnector:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TradeCloseHandler:
-    """
-    Listens for trade close events from Layer 5 and journals them to Layer 6.
-    Registers as a callback on the ExecutionEngine.
-    """
-
     def __init__(self, journal: JournalManager,
                  decision_eng: DecisionEngine,
                  chaos: ChaosModeEngine):
@@ -985,7 +813,6 @@ class TradeCloseHandler:
                          hold_hours      : float,
                          regime_at_exit  : Optional[str] = None,
                          mtf_at_exit     : Optional[float] = None):
-        """Called by Layer 5 when a trade closes."""
         try:
             self._journal.record_trade_close(
                 trade_id       = trade_id,
@@ -1000,7 +827,6 @@ class TradeCloseHandler:
                 mtf_at_exit    = mtf_at_exit,
             )
 
-            # Feed outcome back to Layer 3 EV engine
             if regime_at_exit:
                 self._l3.record_trade_outcome(
                     pair   = pair,
@@ -1023,17 +849,6 @@ class TradeCloseHandler:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TradingSystem:
-    """
-    The complete assembled system.
-
-    Instantiates every layer, wires them together, and runs the main loop.
-
-    Usage:
-        system = TradingSystem(cfg)
-        system.start()         # blocking — runs until Ctrl+C or shutdown()
-        system.shutdown()      # graceful stop from another thread
-    """
-
     def __init__(self, cfg: SystemConfig):
         self._cfg      = cfg
         self._running  = False
@@ -1046,47 +861,21 @@ class TradingSystem:
         logger.info(f"Paper trading   : {cfg.paper_trading}")
         logger.info(f"Pairs           : {', '.join(cfg.pairs)}")
 
-        # ── Layer 1 ───────────────────────────────────────────────────────────
         self.feeds      = Layer1FeedBundle(cfg)
-
-        # ── Layer 2 ───────────────────────────────────────────────────────────
         self.feature_eng= FeatureEngine()
-
-        # ── Layer 3 ───────────────────────────────────────────────────────────
         self.decision   = DecisionEngine()
-
-        # ── Layer 4A ──────────────────────────────────────────────────────────
-        self.risk_ctrl  = RiskControlManager(
-            initial_balance = cfg.account_balance
-        )
-
-        # ── Layer 4B ──────────────────────────────────────────────────────────
-        self.portfolio  = PortfolioExposureManager(
-            account_balance = cfg.account_balance
-        )
-
-        # ── Layer 5 ───────────────────────────────────────────────────────────
+        self.risk_ctrl  = RiskControlManager(initial_balance=cfg.account_balance)
+        self.portfolio  = PortfolioExposureManager(account_balance=cfg.account_balance)
         self.execution  = ExecutionEngine(
             paper_trading   = cfg.paper_trading,
             account_balance = cfg.account_balance,
         )
-
-        # ── Layer 6 ───────────────────────────────────────────────────────────
         self.journal    = JournalManager(db_path=cfg.journal_db_path)
-
-        # ── Layer 7 ───────────────────────────────────────────────────────────
         self.validation = ValidationEngine()
-
-        # ── Layer 8 ───────────────────────────────────────────────────────────
         self.learning   = LearningLoop(validation_engine=self.validation)
-
-        # ── Layer 9 ───────────────────────────────────────────────────────────
         self.chaos      = ChaosModeEngine()
-
-        # ── Layer 10 ──────────────────────────────────────────────────────────
         self.optimizer  = OptimizationEngine()
 
-        # ── Signal processor ──────────────────────────────────────────────────
         self.signal_proc = SignalProcessor(
             feeds        = self.feeds,
             feature_eng  = self.feature_eng,
@@ -1099,17 +888,14 @@ class TradingSystem:
             cfg          = cfg,
         )
 
-        # ── Live feed connector ───────────────────────────────────────────────
         self.live_feed  = OANDALiveFeedConnector(self.feeds, cfg)
 
-        # ── Trade close handler ───────────────────────────────────────────────
         self.close_handler = TradeCloseHandler(
             journal      = self.journal,
             decision_eng = self.decision,
             chaos        = self.chaos,
         )
 
-        # ── Background threads ────────────────────────────────────────────────
         self.learning_thread = LearningThread(
             journal    = self.journal,
             validation = self.validation,
@@ -1124,28 +910,19 @@ class TradingSystem:
             interval_s  = cfg.optimization_interval_s,
         )
 
-        # Wire trade close callback into Layer 5
         if hasattr(self.execution, "set_close_callback"):
             self.execution.set_close_callback(self.close_handler.on_trade_closed)
 
         logger.info("All layers initialised ✅")
 
     def start(self):
-        """Start the system. Blocks until shutdown() is called or Ctrl+C."""
-        # Only set signal handlers if we're in the main thread
         if threading.current_thread() is threading.main_thread():
             signal.signal(signal.SIGINT,  self._handle_signal)
             signal.signal(signal.SIGTERM, self._handle_signal)
 
         logger.info("Starting all subsystems...")
-
-        # Start Layer 1 feed threads
         self.feeds.start()
-
-        # Start live price feed
         self.live_feed.start()
-
-        # Start background threads
         self.learning_thread.start()
         self.opt_thread.start()
 
@@ -1157,17 +934,11 @@ class TradingSystem:
         self._main_loop()
 
     def shutdown(self, reason: str = "MANUAL"):
-        """Graceful shutdown from any thread."""
         if self._running:
             logger.info(f"Shutdown requested: {reason}")
             self._shutdown.set()
 
     def _main_loop(self):
-        """
-        Main signal loop.
-        Runs until shutdown event is set.
-        Throttled by tick_interval_ms.
-        """
         interval_s = self._cfg.tick_interval_ms / 1000.0
         cycle      = 0
 
@@ -1175,11 +946,8 @@ class TradingSystem:
             try:
                 cycle += 1
                 t_start = time.time()
-
-                # Run one full signal cycle
                 self.signal_proc.run_cycle(self._cfg.pairs)
 
-                # Throttle to avoid hammering Layer 2
                 elapsed = time.time() - t_start
                 sleep_t = max(0.0, interval_s - elapsed)
                 if sleep_t > 0:
@@ -1190,24 +958,19 @@ class TradingSystem:
             except Exception as e:
                 logger.error(f"Main loop error (cycle {cycle}): {e}")
                 logger.debug(traceback.format_exc())
-                time.sleep(1.0)   # Brief pause before retry
+                time.sleep(1.0)
 
         self._teardown()
 
     def _teardown(self):
-        """Graceful shutdown of all components."""
         logger.info("Shutting down...")
         self._running = False
 
-        # Stop background threads
         self.learning_thread.stop()
         self.opt_thread.stop()
-
-        # Stop feeds
         self.live_feed.stop()
         self.feeds.stop()
 
-        # Final journal snapshot
         try:
             self.journal.save_performance_snapshot()
             counts = self.journal.get_total_counts()
@@ -1224,11 +987,9 @@ class TradingSystem:
         logger.info("═" * 60)
 
     def _handle_signal(self, signum, frame):
-        """OS signal handler for Ctrl+C / SIGTERM."""
         self.shutdown(reason=f"OS_SIGNAL_{signum}")
 
     def get_status(self) -> dict:
-        """Return current system status snapshot."""
         chaos_status = self.chaos.get_full_status()
         journal_counts = self.journal.get_total_counts()
         return {
@@ -1249,21 +1010,18 @@ class TradingSystem:
 # SECTION 8 — FLASK APP
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Create Flask app
 app = Flask(__name__)
-
-# Create data collector (from dashboard.py)
 collector = DataCollector()
 
 @app.route('/')
 def index():
-    collector.refresh()
+    # ✅ FIX: removed collector.refresh() — get() handles refresh internally
     data = collector.get()
     return build_html(data)
 
 @app.route('/api/data')
 def api_data():
-    collector.refresh()
+    # ✅ FIX: removed collector.refresh() — get() handles refresh internally
     data = collector.get()
     return jsonify(data)
 
@@ -1273,7 +1031,6 @@ def health():
 
 @app.route('/journal')
 def journal_redirect():
-    # Link to the journal dashboard (separate service)
     return '<a href="https://dogma-fx-web.onrender.com">📊 Open Full Journal Intelligence Dashboard</a>'
 
 
@@ -1282,13 +1039,9 @@ def journal_redirect():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Load config from environment
     cfg = SystemConfig().load_from_env()
-
-    # Set log level
     logging.getLogger().setLevel(getattr(logging, cfg.log_level, logging.INFO))
 
-    # Print startup banner
     print()
     print("╔══════════════════════════════════════════════════════════╗")
     print("║     FOREX TRADING SIGNAL SYSTEM — VERSION 6.0           ║")
@@ -1300,17 +1053,13 @@ if __name__ == "__main__":
     print("╚══════════════════════════════════════════════════════════╝")
     print()
 
-    # Create the trading system
     system = TradingSystem(cfg)
 
-    # Start the trading loop in a background thread (so Flask can run)
     def run_trading():
-        system.start()   # this blocks until shutdown
+        system.start()
 
     trading_thread = threading.Thread(target=run_trading, daemon=True)
     trading_thread.start()
 
-    # Now start the Flask web server (main thread)
-    # Render provides PORT env var
     port = int(os.getenv("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
