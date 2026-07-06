@@ -110,6 +110,7 @@ class PriceFeedAdapter:
             "ask"               : state.get("latest_ask"),
             "timestamp_utc"     : state.get("latest_timestamp"),
             "active_session"    : state.get("active_session", "OVERLAP"),
+            "latency_ms"        : None,  # not stored in state
         }
 
     def get_state(self, instrument: str) -> Optional[dict]:
@@ -562,7 +563,7 @@ class SignalProcessor:
             f"regime={decision.regime_tag}"
         )
 
-        # ── Get market snapshot first (needed for entry price and other data) ──
+        # ── Get market snapshot from Layer 1 package ──────────────────────────
         market = self._get_market_snapshot(pair, fp)
         if market is None:
             logger.warning(f"{pair}: no market snapshot — execution skipped")
@@ -714,31 +715,33 @@ class SignalProcessor:
         except Exception as e:
             logger.debug(f"Chaos monitor update error: {e}")
 
-    def _get_market_snapshot(self, pair: str,
-                              fp) -> Optional[MarketSnapshot]:
+    # ── ✅ FIXED: Market snapshot using Layer 1 package ──────────────────────
+    def _get_market_snapshot(self, pair: str, fp) -> Optional[MarketSnapshot]:
+        """Build MarketSnapshot from Layer 1 package (most reliable)."""
         try:
-            state = self._feeds.price_feed.get_state(pair)
-            if not state:
+            pkg = self._feeds.price_feed.get_layer1_package(pair)
+            if not pkg or pkg.get("null_data"):
                 return None
-            bid = state.get("bid") or state.get("last_bid")
-            ask = state.get("ask") or state.get("last_ask")
-            if not bid or not ask:
+
+            bid = pkg.get("latest_bid")
+            ask = pkg.get("latest_ask")
+            if bid is None or ask is None:
                 return None
-            pip_size   = 0.01 if "JPY" in pair else 0.0001
-            spread_pips= round((ask - bid) / pip_size, 2)
-            avg_spread = spread_pips
-            spread_ratio = 1.0
+
+            pip_size = 0.01 if "JPY" in pair else 0.0001
+            spread_pips = round((ask - bid) / pip_size, 2)
+
             return MarketSnapshot(
-                pair            = pair,
-                bid             = bid,
-                ask             = ask,
-                spread_pips     = spread_pips,
-                avg_spread_pips = avg_spread,
-                latency_ms      = state.get("latency_ms"),
-                session         = state.get("active_session", "OVERLAP"),
-                spread_ratio    = spread_ratio,
-                timestamp_utc   = state.get("timestamp_utc", time.time() * 1000),
-                feed_health     = state.get("feed_health", "HEALTHY"),
+                pair=pair,
+                bid=bid,
+                ask=ask,
+                spread_pips=spread_pips,
+                avg_spread_pips=spread_pips,
+                latency_ms=pkg.get("latency_ms"),
+                session=pkg.get("active_session", "OVERLAP"),
+                spread_ratio=1.0,
+                timestamp_utc=pkg.get("timestamp_utc", time.time() * 1000),
+                feed_health=pkg.get("feed_health", "HEALTHY"),
             )
         except Exception as e:
             logger.debug(f"MarketSnapshot error {pair}: {e}")
