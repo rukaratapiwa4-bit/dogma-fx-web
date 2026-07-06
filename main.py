@@ -157,12 +157,14 @@ class SystemConfig:
     optimization_interval_s : int   = 30
     journal_db_path         : str   = "journal.db"
     log_level               : str   = "INFO"
+    database_url            : Optional[str] = None
 
     def load_from_env(self):
         import os
         self.oanda_api_key      = os.getenv("OANDA_API_KEY",      self.oanda_api_key)
         self.oanda_account_id   = os.getenv("OANDA_ACCOUNT_ID",   self.oanda_account_id)
         self.anthropic_api_key  = os.getenv("ANTHROPIC_API_KEY",  self.anthropic_api_key)
+        self.database_url       = os.getenv("DATABASE_URL",       self.database_url)
         oanda_env               = os.getenv("OANDA_PRACTICE", "true").lower()
         self.oanda_practice     = oanda_env != "false"
         paper_env               = os.getenv("PAPER_TRADING", "true").lower()
@@ -237,7 +239,6 @@ class Layer1FeedBundle:
         except Exception: pass
         logger.info("Layer 1 feeds stopped ✅")
 
-    # ✅ FIXED: OANDA feed calls on_tick with 'instrument' parameter
     def on_tick(self, instrument: str, timestamp_utc: float,
                 bid: float, ask: float,
                 bid_volume: float = 0.0, ask_volume: float = 0.0,
@@ -561,10 +562,34 @@ class SignalProcessor:
             f"regime={decision.regime_tag}"
         )
 
+        # ── Get market snapshot first (needed for entry price and other data) ──
+        market = self._get_market_snapshot(pair, fp)
+        if market is None:
+            logger.warning(f"{pair}: no market snapshot — execution skipped")
+            return
+
+        entry_price = market.mid
+
+        # ── Extract values from feature package ──────────────────────────────
+        atr_pips = getattr(fp, 'atr_value', None) or getattr(fp, 'atr_pips', 8.5)
+        vix_level = getattr(fp, 'vix_level', None)
+        dxy_vol_score = getattr(fp, 'dxy_volatility_score', None)
+        currency_iv = getattr(fp, 'implied_vol', None)
+        stress_count = getattr(fp, 'multi_stress_count', 0)
+
+        # ── Layer 4A: Risk Control ────────────────────────────────────────────
         try:
             risk_output = self._l4a.process(
                 decision        = decision,
-                feature_package = fp,
+                entry_price     = entry_price,
+                atr_pips        = atr_pips,
+                vix_level       = vix_level,
+                dxy_vol_score   = dxy_vol_score,
+                currency_iv     = currency_iv,
+                stress_count    = stress_count,
+                is_weekend      = False,
+                is_overnight    = False,
+                broker_ok       = True,
             )
         except Exception as e:
             logger.error(f"Layer 4A error on {pair}: {e}")
@@ -581,6 +606,7 @@ class SignalProcessor:
             logger.info(f"{pair}: NULL_RISK — Layer 4A blocked")
             return
 
+        # Layer 9: check risk cap
         risk_cap = self._chaos.get_risk_cap()
         if risk_cap < risk_output.risk_pct:
             risk_output.risk_pct  = risk_cap
@@ -595,6 +621,7 @@ class SignalProcessor:
                 f"{risk_cap}% (chaos phase={chaos_state})"
             )
 
+        # ── Layer 4B: Portfolio Exposure ──────────────────────────────────────
         try:
             portfolio_output = self._l4b.process(
                 risk_output     = risk_output,
@@ -616,17 +643,13 @@ class SignalProcessor:
             logger.info(f"{pair}: NULL_RISK — Layer 4B blocked (portfolio)")
             return
 
-        market = self._get_market_snapshot(pair, fp)
-        if market is None:
-            logger.warning(f"{pair}: no market snapshot — execution skipped")
-            return
-
+        # ── Layer 5: Execution ─────────────────────────────────────────────────
         try:
             exec_result = self._l5.execute(
                 portfolio_output  = portfolio_output,
                 decision          = decision,
                 market            = market,
-                entry_price       = market.mid,
+                entry_price       = entry_price,
                 atr_pips          = risk_output.atr_pips,
             )
         except Exception as e:
@@ -640,6 +663,7 @@ class SignalProcessor:
             )
             return
 
+        # ── Layer 6: Journal trade open ───────────────────────────────────────
         try:
             self._l6.record_trade_open(
                 trade_id         = exec_result.get("trade_id", ""),
@@ -879,7 +903,8 @@ class TradingSystem:
             paper_trading   = cfg.paper_trading,
             account_balance = cfg.account_balance,
         )
-        self.journal    = JournalManager(db_path=cfg.journal_db_path)
+        self.journal    = JournalManager(db_path=cfg.journal_db_path,
+                                         database_url=cfg.database_url)
         self.validation = ValidationEngine()
         self.learning   = LearningLoop(validation_engine=self.validation)
         self.chaos      = ChaosModeEngine()
