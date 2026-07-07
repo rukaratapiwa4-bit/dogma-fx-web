@@ -624,22 +624,23 @@ class SignalProcessor:
             )
 
         # ── Layer 4B: Portfolio Exposure ──────────────────────────────────────
+        # ✅ FIXED: Correct call with only risk_output and entry_price
         try:
             portfolio_output = self._l4b.process(
-                risk_output     = risk_output,
-                decision        = decision,
-                feature_package = fp,
+                risk_output = risk_output,
+                entry_price = entry_price,
             )
         except Exception as e:
             logger.error(f"Layer 4B error on {pair}: {e}")
             return
 
-        if portfolio_output.null_issued:
+        # Check portfolio approval
+        if not portfolio_output.approved:
             self._l6.record_null(
                 pair        = pair,
                 decision    = {**decision.to_dict(),
-                               "primary_null": "NULL_RISK",
-                               "null_reason" : "Layer 4B portfolio block"},
+                               "primary_null": portfolio_output.null_type or "NULL_RISK",
+                               "null_reason": portfolio_output.rejection_reason or "Layer 4B portfolio block"},
                 feature_pkg = fp.to_dict() if fp else {},
             )
             logger.info(f"{pair}: NULL_RISK — Layer 4B blocked (portfolio)")
