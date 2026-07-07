@@ -596,15 +596,16 @@ class SignalProcessor:
             logger.error(f"Layer 4A error on {pair}: {e}")
             return
 
-        if risk_output.risk_state == RiskState.BLOCKED:
+        # ✅ FIX: Use risk_output.approved instead of RiskState.BLOCKED
+        if not risk_output.approved:
             self._l6.record_null(
                 pair        = pair,
                 decision    = {**decision.to_dict(),
-                               "primary_null": "NULL_RISK",
-                               "null_reason" : "Layer 4A block"},
+                               "primary_null": risk_output.null_type or "NULL_RISK",
+                               "null_reason": risk_output.rejection_reason or "Layer 4A rejected"},
                 feature_pkg = fp.to_dict() if fp else {},
             )
-            logger.info(f"{pair}: NULL_RISK — Layer 4A blocked")
+            logger.info(f"{pair}: NULL_RISK — Layer 4A rejected")
             return
 
         # Layer 9: check risk cap
