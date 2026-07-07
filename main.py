@@ -624,7 +624,6 @@ class SignalProcessor:
             )
 
         # ── Layer 4B: Portfolio Exposure ──────────────────────────────────────
-        # ✅ FIXED: Correct call with only risk_output and entry_price
         try:
             portfolio_output = self._l4b.process(
                 risk_output=risk_output,
@@ -670,10 +669,11 @@ class SignalProcessor:
             logger.error(f"Layer 5 error on {pair}: {e}")
             return
 
-        if not exec_result or exec_result.get("status") != "FILLED":
+        # ── ✅ FIX: Check 'executed' flag instead of 'status' ─────────────────
+        if not exec_result or not exec_result.get("executed", False):
             logger.info(
                 f"{pair}: execution not filled | "
-                f"status={exec_result.get('status') if exec_result else 'None'}"
+                f"executed={exec_result.get('executed') if exec_result else 'None'}"
             )
             return
 
